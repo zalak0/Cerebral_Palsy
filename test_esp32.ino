@@ -98,7 +98,7 @@ int find_pitch_period(int32_t buf[], int frames) {
   // 80 Hz = 200 samples period
   // 800 Hz = 20 samples period
   
-  int min_period = 20;   // ~800 Hz (high pitch limit)
+  int min_period = 5;   // ~3200 Hz (high pitch limit)
   int max_period = 200;  // ~80 Hz (low pitch limit)
   
   // Make sure we don't exceed buffer
@@ -153,8 +153,8 @@ void setup() {
   analogSetAttenuation(ADC_11db);
   
   // Initialize history
-  for (int i = 0; i < HISTORY_SIZE; i++) {
-    rms_history[i] = 0.0;
+  for (int i = 0; i < ZCR_HISTORY_SIZE; i++) {
+    zcr_history[i] = 0.0;
   }
 }
 
@@ -189,11 +189,11 @@ void loop() {
   double rmsR_db = 20.0 * log10(rmsR + 1e-9);
 
   // Store RMS in history for fluctuation analysis
-  rms_history[history_index] = rmsL;
-  history_index++;
-  if (history_index >= HISTORY_SIZE) {
-    history_index = 0;
-    history_filled = true;
+  zcr_history[zcr_history_index] = rmsL;
+  zcr_history_index++;
+  if (zcr_history_index >= ZCR_HISTORY_SIZE) {
+    zcr_history_index = 0;
+    zcr_history_filled = true;
   }
 
   // Calculate features
@@ -219,8 +219,8 @@ void loop() {
   float PITCH_CRY_MAX = 700;
   
   int pot = readPotAvg();
-  double voice_db = map(pot, 0, 4095, 30, 80);
-  double scream_db = voice_db + 15.0;
+  double voice_db = map(pot, 0, 4095, 30, 90);
+  double scream_db = voice_db + 20.0;
 
   // Detection logic with multiple features
   bool loud_enough = rmsL_db > voice_db;
@@ -260,7 +260,7 @@ void loop() {
   Serial.print(" ");
   Serial.print(zcr * 100);  // Scale ZCR
   Serial.print(" ");
-  Serial.println(fluctuation * 100);  // Scale fluctuation
+  Serial.println(pitch_freq);  // Show actual pitch frequency
   
   // Debug output (uncomment to see details)
   // Serial.print("  Pitch=");
