@@ -8,31 +8,31 @@
 #include "esp_afe_sr_models.h"
 #include "model_path.h"
 #include "esp_heap_caps.h"
+#include "esp_dsp.h"
+
 
 static const char* TAG = "BabyCry";
 
 // Pin definitions for both microphones
 static const int PIN_BCLK = 12;
 static const int PIN_WS   = 13;
-static const int PIN_DIN_1  = 11;
-static const int PIN_DIN_2  = 6;
+static const int PIN_DIN = 11;
 
 static const int PIN_POT = 7;
 static const int PIN_DETECT = 8;
 static const int PIN_SCREAM = 9;
 static const int PIN_CRY = 10;
 
-static const int SAMPLE_RATE = 16000;
-static const int FRAME_SAMPLES = 512;
+static const int SAMPLE_RATE = 96000;
+static const int FRAME_SAMPLES = 1024;
 
-// ZCR history for variation tracking
-static const int ZCR_HISTORY_SIZE = 10;
-static float zcr_history[ZCR_HISTORY_SIZE];
-static int zcr_history_index = 0;
-static bool zcr_history_filled = false;
+#define FFT_SIZE FRAME_SAMPLES
+static float fft_l[FFT_SIZE * 2];
+static float fft_r[FFT_SIZE * 2];
+static float cross_spec[FFT_SIZE * 2];
+static float corr[FFT_SIZE];
 
-static i2s_chan_handle_t rx_chan_1;  // First microphone
-static i2s_chan_handle_t rx_chan_2;  // Second microphone
+static i2s_chan_handle_t rx_chan;
 
 // AFE variables
 static const esp_afe_sr_iface_t *afe_handle = NULL;
@@ -43,52 +43,28 @@ static int afe_feed_chunksize = 0;
 static int afe_feed_channels = 0;
 
 void setupI2S() {
-  ESP_LOGI(TAG, "Setting up I2S...");
+  ESP_LOGI(TAG, "Setting up I2S for DUAL microphones (stereo)...");
   
-  // MIC 1
-  i2s_chan_config_t chan_cfg_1 = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-  ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg_1, NULL, &rx_chan_1));
+  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+  ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &rx_chan));
 
-  i2s_std_config_t std_cfg_1 = {};
-  std_cfg_1.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE);
-  std_cfg_1.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO);
+  i2s_std_config_t std_cfg = {};
+  std_cfg.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE);
+  std_cfg.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO);  // STEREO!
 
-  std_cfg_1.gpio_cfg.mclk = I2S_GPIO_UNUSED;
-  std_cfg_1.gpio_cfg.bclk = (gpio_num_t)PIN_BCLK;
-  std_cfg_1.gpio_cfg.ws   = (gpio_num_t)PIN_WS;
-  std_cfg_1.gpio_cfg.dout = I2S_GPIO_UNUSED;
-  std_cfg_1.gpio_cfg.din  = (gpio_num_t)PIN_DIN_1;
-  std_cfg_1.gpio_cfg.invert_flags.mclk_inv = false;
-  std_cfg_1.gpio_cfg.invert_flags.bclk_inv = false;
-  std_cfg_1.gpio_cfg.invert_flags.ws_inv   = false;
+  std_cfg.gpio_cfg.mclk = I2S_GPIO_UNUSED;
+  std_cfg.gpio_cfg.bclk = (gpio_num_t)PIN_BCLK;
+  std_cfg.gpio_cfg.ws   = (gpio_num_t)PIN_WS;
+  std_cfg.gpio_cfg.dout = I2S_GPIO_UNUSED;
+  std_cfg.gpio_cfg.din  = (gpio_num_t)PIN_DIN;  // Reads both channels
+  std_cfg.gpio_cfg.invert_flags.mclk_inv = false;
+  std_cfg.gpio_cfg.invert_flags.bclk_inv = false;
+  std_cfg.gpio_cfg.invert_flags.ws_inv   = false;
 
-  ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_chan_1, &std_cfg_1));
-  ESP_ERROR_CHECK(i2s_channel_enable(rx_chan_1));
-
-  ESP_LOGI(TAG, "Microphone 1 initialized on I2S_NUM_0");
-
-  // MIC 2
-  i2s_chan_config_t chan_cfg_2 = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-  ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg_2, NULL, &rx_chan_2));
-
-  i2s_std_config_t std_cfg_2 = {};
-  std_cfg_2.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE);
-  std_cfg_2.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO);
-
-  std_cfg_2.gpio_cfg.mclk = I2S_GPIO_UNUSED;
-  std_cfg_2.gpio_cfg.bclk = (gpio_num_t)PIN_BCLK;
-  std_cfg_2.gpio_cfg.ws   = (gpio_num_t)PIN_WS;
-  std_cfg_2.gpio_cfg.dout = I2S_GPIO_UNUSED;
-  std_cfg_2.gpio_cfg.din  = (gpio_num_t)PIN_DIN_2;
-  std_cfg_2.gpio_cfg.invert_flags.mclk_inv = false;
-  std_cfg_2.gpio_cfg.invert_flags.bclk_inv = false;
-  std_cfg_2.gpio_cfg.invert_flags.ws_inv   = false;
-
-  ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_chan_2, &std_cfg_2));
-  ESP_ERROR_CHECK(i2s_channel_enable(rx_chan_2));
+  ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_chan, &std_cfg));
+  ESP_ERROR_CHECK(i2s_channel_enable(rx_chan));
   
-  ESP_LOGI(TAG, "Microphone 2 initialized on I2S_NUM_1");
-  ESP_LOGI(TAG, "Dual I2S setup complete!");
+  ESP_LOGI(TAG, "Dual I2S microphones setup complete (stereo mode)!");
 }
 
 void print_memory_info() {
@@ -111,7 +87,7 @@ void setupAFE() {
   
   // Create AFE config - use PSRAM aggressively
   afe_config_t *afe_cfg = afe_config_init(
-    "TM",
+    "MM",
     models,
     AFE_TYPE_SR,
     AFE_MODE_LOW_COST
@@ -124,13 +100,14 @@ void setupAFE() {
   afe_cfg->vad_init = true;       // Voice activity detection
   afe_cfg->wakenet_init = false;  // No wake word detection
   afe_cfg->vad_mode = VAD_MODE_3; // Aggressive VAD
-  afe_cfg->afe_ringbuf_size = 100; // Ring buffer size
+  afe_cfg->afe_ringbuf_size = 250; // Ring buffer size
   afe_cfg->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
   
-  // Dual-mic specific settings
-  afe_cfg->pcm_config.total_ch_num = 2;  // 2 microphones
-  afe_cfg->pcm_config.mic_num = 2;       // 2 microphones
-  afe_cfg->pcm_config.ref_num = 0;       // No reference channel
+  // The pcm_config is automatically set from "MM" string, but verify:
+  ESP_LOGI(TAG, "PCM Config - Total channels: %d, Mic channels: %d, Ref channels: %d",
+           afe_cfg->pcm_config.total_ch_num,
+           afe_cfg->pcm_config.mic_num,
+           afe_cfg->pcm_config.ref_num);
 
   ESP_LOGI(TAG, "AFE config created (ringbuf_size=100, PSRAM mode)");
   print_memory_info();
@@ -207,73 +184,89 @@ int readPotAvg() {
   return sum / 8;
 }
 
-float zcr_calculation(int16_t buf[], int frames) {
-  int zeroCrossings = 0;
-  
-  for (int i = 1; i < frames; i++) {
-    if ((buf[i-1] >= 0 && buf[i] < 0) || (buf[i-1] < 0 && buf[i] >= 0)) {
-      zeroCrossings++;
-    }
-  }
+int estimate_delay(const int16_t* left,
+                   const int16_t* right,
+                   int samples) {
+    int maxLag = 3;
+    int bestLag = 0;
+    int64_t bestCorr = 0;
 
-  return (float)zeroCrossings / frames;
+    for (int lag = -maxLag; lag <= maxLag; lag++) {
+        int64_t corr = 0;
+
+        for (int i = maxLag; i < samples - maxLag; i++) {
+            int j = i + lag;
+            if (j < 0 || j >= samples) continue;
+            corr += left[i] * right[j];
+        }
+
+        int64_t mag = llabs(corr);
+        if (mag > bestCorr) {
+            bestCorr = mag;
+            bestLag = lag;
+        }
+    }
+    return bestLag;
 }
 
-float calculate_zcr_variation() {
-  if (!zcr_history_filled && zcr_history_index < 5) {
-    return 0.0;
-  }
-  
-  int size = zcr_history_filled ? ZCR_HISTORY_SIZE : zcr_history_index;
-  
-  float sum = 0.0;
-  for (int i = 0; i < size; i++) {
-    sum += zcr_history[i];
-  }
-  float mean = sum / size;
-  
-  float variance = 0.0;
-  for (int i = 0; i < size; i++) {
-    float diff = zcr_history[i] - mean;
-    variance += diff * diff;
-  }
-  float std_dev = std::sqrt(variance / size);
-  
-  return std_dev;
+int estimate_delay_gcc_phat(int16_t *x, int16_t *y, int N)
+{
+    // Convert to float, real FFT input
+    for (int i = 0; i < N; i++) {
+        fft_l[2*i]   = (float)x[i];
+        fft_l[2*i+1] = 0.0f;
+        fft_r[2*i]   = (float)y[i];
+        fft_r[2*i+1] = 0.0f;
+    }
+
+    dsps_fft2r_fc32(fft_l, N);
+    dsps_fft2r_fc32(fft_r, N);
+    dsps_bit_rev_fc32(fft_l, N);
+    dsps_bit_rev_fc32(fft_r, N);
+
+    // Cross power spectrum with PHAT
+    for (int i = 0; i < N; i++) {
+        float rl = fft_l[2*i];
+        float il = fft_l[2*i+1];
+        float rr = fft_r[2*i];
+        float ir = fft_r[2*i+1];
+
+        float real = rl*rr + il*ir;
+        float imag = il*rr - rl*ir;
+
+        float mag = sqrtf(real*real + imag*imag) + 1e-9f;
+
+        cross_spec[2*i]   = real / mag;
+        cross_spec[2*i+1] = imag / mag;
+    }
+
+    // IFFT
+    dsps_fft2r_fc32(cross_spec, N);
+    dsps_bit_rev_fc32(cross_spec, N);
+
+    for (int i = 0; i < N; i++) {
+        corr[i] = cross_spec[2*i];
+    }
+
+    // Find peak
+    int max_idx = 0;
+    float max_val = corr[0];
+    for (int i = 1; i < N; i++) {
+        if (corr[i] > max_val) {
+            max_val = corr[i];
+            max_idx = i;
+        }
+    }
+
+    // Wrap negative delays
+    int delay = max_idx;
+    if (delay > N / 2) {
+        delay -= N;
+    }
+
+    return delay;
 }
 
-int find_pitch_period(int16_t buf[], int frames) {
-  int min_period = 5;
-  int max_period = 200;
-  
-  if (max_period >= frames) {
-    max_period = frames - 1;
-  }
-  
-  float max_correlation = 0.0;
-  int best_period = min_period;
-  
-  for (int period = min_period; period <= max_period; period++) {
-    float correlation = 0.0;
-    int count = 0;
-    
-    for (int i = 0; i < frames - period; i++) {
-      correlation += (float)buf[i] * (float)buf[i + period];
-      count++;
-    }
-    
-    if (count > 0) {
-      correlation /= count;
-    }
-    
-    if (correlation > max_correlation) {
-      max_correlation = correlation;
-      best_period = period;
-    }
-  }
-  
-  return best_period;
-}
 
 void setup() {  
   Serial.begin(115200);
@@ -292,10 +285,8 @@ void setup() {
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
   ESP_LOGI(TAG, "ADC configured");
-  
-  for (int i = 0; i < ZCR_HISTORY_SIZE; i++) {
-    zcr_history[i] = 0.0;
-  }
+
+  ESP_ERROR_CHECK(dsps_fft2r_init_fc32(NULL, FRAME_SAMPLES));
   
   ESP_LOGI(TAG, "========================================");
   ESP_LOGI(TAG, "AFE Status: %s", use_afe ? "ENABLED" : "DISABLED");
@@ -304,59 +295,107 @@ void setup() {
 }
 
 void loop() {
-  static int32_t i2s_buf_1[FRAME_SAMPLES];  // Mic 1 buffer (mono)
-  static int32_t i2s_buf_2[FRAME_SAMPLES];  // Mic 2 buffer (mono)
+  static int32_t i2s_buf[FRAME_SAMPLES * 2];  // Stereo buffer
   static int16_t audio_stereo[FRAME_SAMPLES * 2];
   static int loop_count = 0;
-  size_t bytes_read_1 = 0;
-  size_t bytes_read_2 = 0;
+  size_t bytes_read = 0;
 
-  // Read from both I2S channels
-  esp_err_t err1 = i2s_channel_read(rx_chan_1, i2s_buf_1, sizeof(i2s_buf_1), &bytes_read_1, pdMS_TO_TICKS(200));
-  esp_err_t err2 = i2s_channel_read(rx_chan_2, i2s_buf_2, sizeof(i2s_buf_2), &bytes_read_2, pdMS_TO_TICKS(200));
+  // Read stereo data from single I2S channel
+  esp_err_t err = i2s_channel_read(rx_chan, i2s_buf, sizeof(i2s_buf), &bytes_read, pdMS_TO_TICKS(200));
   
-  if (err1 != ESP_OK || bytes_read_1 == 0 || err2 != ESP_OK || bytes_read_2 == 0) {
-    ESP_LOGW(TAG, "I2S read timeout/error on one or both channels");
+  if (err != ESP_OK || bytes_read == 0) {
+    ESP_LOGW(TAG, "I2S read timeout/error");
     return;
   }
 
-  int frames = min(bytes_read_1 / sizeof(int32_t), bytes_read_2 / sizeof(int32_t));
+  int frames = bytes_read / (sizeof(int32_t) * 2);
   
-  // Convert 32-bit stereo to 16-bit stereo (keep both channels!)
+  // Convert 32-bit stereo to 16-bit stereo
   for (int i = 0; i < frames; i++) {
-    int32_t sample1 = i2s_buf_1[i] >> 11;  // Mic 1
-    int32_t sample2 = i2s_buf_2[i] >> 11;  // Mic 2
-    audio_stereo[i * 2 + 0] = (int16_t)sample1;
-    audio_stereo[i * 2 + 1] = (int16_t)sample2;
+    int32_t sampleL = i2s_buf[i * 2 + 0] >> 11;  // Mic 1 (Left channel)
+    int32_t sampleR = i2s_buf[i * 2 + 1] >> 11;  // Mic 2 (Right channel)
+    audio_stereo[i * 2 + 0] = (int16_t)sampleL;
+    audio_stereo[i * 2 + 1] = (int16_t)sampleR;
   }
+
 
   // Process with AFE if enabled
   int16_t *processed_audio = audio_stereo;
   int processed_frames = frames;
   bool vad_detected = false;
   
-  if (use_afe && afe_handle && afe_data && afe_feed_buf) {
-    // Prepare feed buffer - interleaved stereo format
+if (use_afe && afe_handle && afe_data && afe_feed_buf) {
+
+    // int samples_to_feed = min(afe_feed_chunksize, frames);
+    // ESP_LOGI(TAG, "[FEED] Feeding %d samples to AFE", samples_to_feed);
+
+    // Prepare feed buffer
     for (int i = 0; i < afe_feed_chunksize && i < frames; i++) {
-      afe_feed_buf[i * 2 + 0] = audio_stereo[i * 2 + 0];  // Left mic
-      afe_feed_buf[i * 2 + 1] = audio_stereo[i * 2 + 1];  // Right mic
+      afe_feed_buf[i * 2 + 0] = audio_stereo[i * 2 + 0];
+      afe_feed_buf[i * 2 + 1] = audio_stereo[i * 2 + 1];
     }
+
+    // if (loop_count % 100 == 0) {
+    //   ESP_LOGI(TAG, "Feeding AFE - samples[0]: L=%d R=%d, samples[10]: L=%d R=%d",
+    //            afe_feed_buf[0], afe_feed_buf[1],
+    //            afe_feed_buf[20], afe_feed_buf[21]);
+    // }
     
     // Feed the data
-    afe_handle->feed(afe_data, afe_feed_buf);
+    int feed_result = afe_handle->feed(afe_data, afe_feed_buf);
     
-    // ALWAYS fetch after feeding - this is critical!
-    // Fetch drains the ringbuffer regardless of feed result
+    // if (feed_result == 0) {
+    //   ESP_LOGI(TAG, "[FEED] ✓ Feed successful (result=%d)", feed_result);
+    // } else {
+    //   ESP_LOGW(TAG, "[FEED] ✗ Feed failed or buffer full (result=%d)", feed_result);
+    // }
+    
+    // Small delay to let AFE process
+    vTaskDelay(pdMS_TO_TICKS(1));
+
+    // ============================================
+    // CRITICAL FIX: Fetch TWICE to drain buffer
+    // ============================================
+    
+    // First fetch
     afe_fetch_result_t *afe_result = afe_handle->fetch(afe_data);
+    
+    // if (afe_result) {
+    //   ESP_LOGI(TAG, "[FETCH #1] ret_value=%d, data_size=%d", 
+    //            afe_result->ret_value, afe_result->data_size);
+    // }
     
     if (afe_result && afe_result->ret_value == ESP_OK && afe_result->data) {
       processed_audio = afe_result->data;
       processed_frames = afe_result->data_size / sizeof(int16_t);
       vad_detected = (afe_result->vad_state == VAD_SPEECH);
-    }
-    // If fetch fails or returns no data, we fall back to raw audio_mono
-  }
 
+      // ESP_LOGI(TAG, "[FETCH #1] ✓ Got %d frames, VAD=%s",
+      //          processed_frames, vad_detected ? "SPEECH" : "SILENCE");
+    }
+    
+    // Second fetch - drain remaining data
+    afe_fetch_result_t *afe_result2 = afe_handle->fetch(afe_data);
+    
+    // if (afe_result2) {
+    //   ESP_LOGI(TAG, "[FETCH #2] ret_value=%d, data_size=%d", 
+    //            afe_result2->ret_value, afe_result2->data_size);
+    // }
+    
+    if (afe_result2 && afe_result2->ret_value == ESP_OK && afe_result2->data) {
+      // Use the second fetch result (most recent processed data)
+      processed_audio = afe_result2->data;
+      processed_frames = afe_result2->data_size / sizeof(int16_t);
+      vad_detected = (afe_result2->vad_state == VAD_SPEECH);
+
+      // ESP_LOGI(TAG, "[FETCH #2] ✓ Got %d frames, VAD=%s",
+      //          processed_frames, vad_detected ? "SPEECH" : "SILENCE");
+    }
+    
+    // ESP_LOGI(TAG, "[SUMMARY] Loop #%d: Fed=1024, Fetched (total from 2 fetches), VAD=%d",
+    //          loop_count, vad_detected ? 1 : 0);
+  }
+  
   // Calculate RMS - handle both stereo input and mono AFE output
   double sum = 0.0;
   int sample_count = 0;
@@ -387,6 +426,32 @@ void loop() {
   bool loud_enough = rms_db > voice_db;
   bool screaming = rms_db > scream_db;
 
+  static int16_t left[FRAME_SAMPLES];
+  static int16_t right[FRAME_SAMPLES];
+
+  for (int i = 0; i < frames; i++) {
+      left[i]  = audio_stereo[i * 2];
+      right[i] = audio_stereo[i * 2 + 1];
+  }
+
+  if (loud_enough){
+    int delay_samples = estimate_delay_gcc_phat(left, right, frames);
+    ESP_LOGI(TAG, "Estimated delay between mics: %d samples", delay_samples);
+
+    float mic_distance = 0.023f; // meters (23 mm)
+    float speed_of_sound = 343.0f;
+    float sample_period = 1.0f / SAMPLE_RATE;
+
+    float time_delay = delay_samples * sample_period;
+    float ratio = (time_delay * speed_of_sound) / mic_distance;
+    ratio = fminf(fmaxf(ratio, -1.0f), 1.0f);
+    float angle_rad = asinf(ratio);
+
+    float angle_deg = angle_rad * 180.0f / M_PI;
+
+    ESP_LOGI(TAG, "Manual DOA: %.1f degrees", angle_deg);
+  }
+
   // Output control
   if (screaming) {
     digitalWrite(PIN_SCREAM, HIGH);
@@ -406,9 +471,6 @@ void loop() {
   // Serial output for plotting
   printf("RMS:%.1f,Threshold:%.1f,Scream:%.1f, AFE:%d,VAD:%d\n",
          rms_db, voice_db, scream_db, 
-         //zcr * 100, 
-         //pitch_freq, 
-         //crying_detected ? 80 : 0, 
          use_afe ? 1 : 0, 
          vad_detected ? 1 : 0);
 
