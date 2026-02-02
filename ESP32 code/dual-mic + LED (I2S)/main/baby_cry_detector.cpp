@@ -10,7 +10,17 @@
 #include "esp_heap_caps.h"
 #include "esp_afe_doa.h" 
 
+// Define platform before FastLED
+#ifndef ESP32
+#define ESP32
+#endif
 
+// Force FastLED to use optimized RMT4 driver
+// #define FASTLED_RMT_BUILTIN_DRIVER 1
+// #define FASTLED_USES_ESP32S3_I2S
+#define FASTLED_USES_ESP32S3_I2S
+#include <FastLED.h>
+  
 static const char* TAG = "BabyCry";
 
 // Pin definitions for both microphones
@@ -26,6 +36,13 @@ static const int PIN_DETECT = 8;
 static const int PIN_SCREAM = 9;
 static const int PIN_CRY = 10;
 static const int PIN_REAL = 6;  //PIN_REAL
+
+// LED Strip configuration
+static const int LED_PIN = 2;
+static const int NUM_LEDS = 30;         // Start with 30 LEDs
+static const int BRIGHTNESS = 128;      // 0-255 (50% brightness)
+
+CRGB leds[NUM_LEDS];
 
 // Audio parameters
 static const int SAMPLE_RATE = 16000;
@@ -53,6 +70,19 @@ static const float BABY_ZONE_MAX = 180.0;
 static const float IGNORE_ZONE_MIN = 0.0;   // Ignore: 0° to 90° (Back side)
 static const float IGNORE_ZONE_MAX = 90.0;
 
+// LED visualization settings
+static const float LED_MIN_DB = 30.0;
+static const float LED_MAX_DB = 90.0;
+
+void print_memory_info() {
+  ESP_LOGI(TAG, "=== Memory Info ===");
+  ESP_LOGI(TAG, "Free heap: %lu bytes", esp_get_free_heap_size());
+  ESP_LOGI(TAG, "Free PSRAM: %lu bytes", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+  ESP_LOGI(TAG, "Largest free block PSRAM: %lu bytes", heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+  ESP_LOGI(TAG, "Min free heap: %lu bytes", esp_get_minimum_free_heap_size());
+  ESP_LOGI(TAG, "==================");
+}
+
 void setupI2S() {
   ESP_LOGI(TAG, "Setting up I2S for DUAL microphones (stereo)...");
   
@@ -78,13 +108,29 @@ void setupI2S() {
   ESP_LOGI(TAG, "Dual I2S microphones setup complete (stereo mode)!");
 }
 
-void print_memory_info() {
-  ESP_LOGI(TAG, "=== Memory Info ===");
-  ESP_LOGI(TAG, "Free heap: %lu bytes", esp_get_free_heap_size());
-  ESP_LOGI(TAG, "Free PSRAM: %lu bytes", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-  ESP_LOGI(TAG, "Largest free block PSRAM: %lu bytes", heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
-  ESP_LOGI(TAG, "Min free heap: %lu bytes", esp_get_minimum_free_heap_size());
-  ESP_LOGI(TAG, "==================");
+void setupLEDs() {
+  ESP_LOGI(TAG, "========================================");
+  ESP_LOGI(TAG, "Initializing LED Strip with FastLED RMT5...");
+  
+  // Initialize FastLED with WS2812B
+  FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
+  FastLED.setBrightness(BRIGHTNESS);
+  FastLED.setMaxRefreshRate(60);  // Limit to 60Hz to reduce CPU load
+  
+  // Test pattern - rainbow sweep
+  for (int i = 0; i < NUM_LEDS; i++) {
+    leds[i] = CHSV(i * 255 / NUM_LEDS, 255, 255);
+  }
+  FastLED.show();
+  delay(500);
+  
+  // Clear
+  FastLED.clear();
+  FastLED.show();
+  
+  ESP_LOGI(TAG, "LED Strip initialized: %d LEDs on GPIO %d", NUM_LEDS, LED_PIN);
+  ESP_LOGI(TAG, "Using FastLED RMT4 driver (optimized)");
+  ESP_LOGI(TAG, "========================================");
 }
 
 // Initialize AFE for dual-mic input
@@ -171,16 +217,6 @@ void setupAFE() {
   esp_srmodel_deinit(models);
 }
 
-// Read potentiometer with averaging
-int readPotAvg() {
-  long sum = 0;
-  for (int i = 0; i < 8; i++) {
-    sum += analogRead(PIN_POT);
-    delayMicroseconds(200);
-  }
-  return sum / 8;
-}
-
 // Initialize Direction of Arrival (with AFE implementation) for dual-mic input
 void setupDOA() {
   ESP_LOGI(TAG, "========================================");
@@ -223,6 +259,113 @@ void setupDOA() {
   ESP_LOGI(TAG, "========================================");
 }
 
+// Update LEDs based on audio
+void updateLEDs(double rms_db, bool is_baby_zone, bool loud_enough) {
+  // Map dB to number of LEDs
+  int num_lit = 0;
+  
+  if (rms_db < LED_MIN_DB) {
+    num_lit = 0;
+  } else if (rms_db > LED_MAX_DB) {
+    num_lit = NUM_LEDS;
+  } else {
+    num_lit = map(rms_db * 10, LED_MIN_DB * 10, LED_MAX_DB * 10, 0, NUM_LEDS);
+  }
+  
+  // Clear all LEDs
+  FastLED.clear();
+  
+  // Set colors based on conditions
+  for (int i = 0; i < num_lit; i++) {
+    float position = (float)i / (float)NUM_LEDS;
+    
+    if (rms_db > 80.0) {
+      // SCREAM - Red pulsing
+      leds[i] = CRGB::Red;
+    } else if (is_baby_zone && loud_enough) {
+      // BABY ZONE with voice - Blue to Green gradient
+      uint8_t hue = 96 + position * 64;  // Cyan to Green (HSV: 96-160)
+      leds[i] = CHSV(hue, 255, 255);
+    } else if (loud_enough) {
+      // Voice detected but not baby zone - Yellow/Orange
+      leds[i] = CRGB::Orange;
+    } else {
+      // Just noise - Dim white gradient
+      uint8_t brightness = 30 + position * 100;
+      leds[i] = CRGB(brightness, brightness, brightness);
+    }
+  }
+  
+  FastLED.show();
+}
+
+// VU Meter style
+void updateLEDs_VUMeter(double rms_db) {
+  int num_lit = map(constrain(rms_db, LED_MIN_DB, LED_MAX_DB), 
+                    LED_MIN_DB, LED_MAX_DB, 0, NUM_LEDS);
+  
+  FastLED.clear();
+  
+  for (int i = 0; i < num_lit; i++) {
+    if (i < NUM_LEDS / 3) {
+      leds[i] = CRGB::Green;          // Low - Green
+    } else if (i < NUM_LEDS * 2 / 3) {
+      leds[i] = CRGB::Yellow;         // Medium - Yellow
+    } else {
+      leds[i] = CRGB::Red;            // High - Red
+    }
+  }
+  
+  FastLED.show();
+}
+
+// Spatial visualization
+void updateLEDs_Spatial(double rms_db, float angle) {
+  int num_lit = map(constrain(rms_db, LED_MIN_DB, LED_MAX_DB), 
+                    LED_MIN_DB, LED_MAX_DB, 0, NUM_LEDS);
+  
+  // Map angle (0-180°) to hue (0-255)
+  uint8_t hue = map(angle, 0, 180, 0, 255);
+  
+  FastLED.clear();
+  
+  for (int i = 0; i < num_lit; i++) {
+    leds[i] = CHSV(hue, 255, 255);
+  }
+  
+  FastLED.show();
+}
+
+// Pulsing effect
+void updateLEDs_Pulse(double rms_db, bool is_baby_zone) {
+  static uint8_t pulse = 0;
+  pulse = (pulse + 5) % 256;
+  
+  int num_lit = map(constrain(rms_db, LED_MIN_DB, LED_MAX_DB), 
+                    LED_MIN_DB, LED_MAX_DB, 0, NUM_LEDS);
+  
+  uint8_t brightness = sin8(pulse);
+  CRGB color = is_baby_zone ? CRGB::Blue : CRGB::White;
+  
+  FastLED.clear();
+  
+  for (int i = 0; i < num_lit; i++) {
+    leds[i] = color;
+    leds[i].fadeToBlackBy(255 - brightness);
+  }
+  
+  FastLED.show();
+}
+
+// Read potentiometer with averaging
+int readPotAvg() {
+  long sum = 0;
+  for (int i = 0; i < 8; i++) {
+    sum += analogRead(PIN_POT);
+    delayMicroseconds(200);
+  }
+  return sum / 8;
+}
 void setup() {  
   Serial.begin(115200);
   delay(500);
@@ -232,6 +375,7 @@ void setup() {
   setupI2S();
   setupAFE();  // AFE after I2S
   setupDOA();  // DOA after AFE
+  setupLEDs(); // LEDs last
   
   // Initialise
   pinMode(PIN_DETECT, OUTPUT);
@@ -255,8 +399,6 @@ void loop() {
   static int16_t audio_stereo[FRAME_SAMPLES * 2];
   static int loop_count = 0;
   static float last_sound_angle = 90.0;
-  static int doa_call_counter = 0;
-  static int cached_pot_value = 2048;  // Default to middle
   size_t bytes_read = 0;
 
   // Read stereo data from single I2S channel
@@ -268,6 +410,15 @@ void loop() {
   }
 
   int frames = bytes_read / (sizeof(int32_t) * 2);
+
+  int32_t rms_left = 0;
+  int32_t rms_right = 0;
+  for (int i = 0; i < FRAME_SAMPLES; i++) {
+      rms_left  += i2s_buf[i*2]   * i2s_buf[i*2] >> 11;
+      rms_right += i2s_buf[i*2+1] * i2s_buf[i*2+1] >> 11;
+  }
+
+  ESP_LOGI(TAG, "RMS L: %.1f dB, RMS R: %.1f", rms_left, rms_right);
   
   // Convert 32-bit stereo to 16-bit stereo
   for (int i = 0; i < frames; i++) {
@@ -276,8 +427,6 @@ void loop() {
     audio_stereo[i * 2 + 0] = (int16_t)sampleL;
     audio_stereo[i * 2 + 1] = (int16_t)sampleR;
   }
-
-
   // Process with AFE if enabled
   int16_t *processed_audio = audio_stereo;
   int processed_frames = frames;
@@ -368,14 +517,10 @@ void loop() {
     ESP_LOGI(TAG, "DOA: %.1f° - Zone: %s", sound_angle, zone_name);
     
     last_sound_angle = sound_angle;
-
-    // Early exit if sound is from ignore zone
-    if (sound_from_ignore_zone) {
-      loop_count++;
-      delay(50);
-      return;
-    }
   }
+
+
+  updateLEDs_VUMeter(rms_db);
 
   // Output control
   if (screaming) {
@@ -401,6 +546,7 @@ void loop() {
 
   loop_count++;
   if (loop_count % 20 == 0) {
+
     ESP_LOGI(TAG, "Stats - RMS: %.1f dB, Threshold: %.1f, Angle: %.1f°, Zone: %s, VAD: %s",
              rms_db, voice_db, last_sound_angle,
              sound_from_baby_zone ? "BABY" : "OTHER",
