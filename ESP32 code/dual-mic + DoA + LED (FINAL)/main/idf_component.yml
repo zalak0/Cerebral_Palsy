@@ -17,6 +17,4 @@ dependencies:
   espressif/arduino-esp32: ^3.3.6
   espressif/esp-sr:
     version: "^2.3.0"  # This will get 2.3.x (latest 2.3 patch version)
-  # # Add FastLED for WS2812 control
-  # fastled/FastLED: "^3.10.3"
-  adafruit/Adafruit_NeoPixel: "^1.12.0"
+  espressif/led_strip: "^2.5.5"
