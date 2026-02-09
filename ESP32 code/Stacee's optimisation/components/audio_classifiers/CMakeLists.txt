@@ -1,6 +1,5 @@
 idf_component_register(
     SRCS
-        "male_reject_fft.cpp"
         "laugh.c"
         "arduinoFFT.cpp"
     INCLUDE_DIRS
