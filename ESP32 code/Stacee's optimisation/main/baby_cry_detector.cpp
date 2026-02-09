@@ -240,8 +240,8 @@ static void setupAFE()
       AFE_MODE_LOW_COST);
 
   afe_cfg->aec_init = false;
-  afe_cfg->se_init = false;
-  afe_cfg->ns_init = false;
+  afe_cfg->se_init = true;
+  afe_cfg->ns_init = true;
   afe_cfg->vad_init = true;
   afe_cfg->wakenet_init = false;
   afe_cfg->vad_mode = VAD_MODE_3;

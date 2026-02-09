@@ -1,8 +1,5 @@
-#ifndef CL_DEBUG_DUMP
-#define CL_DEBUG_DUMP 1
-#endif
-
 #pragma once
+
 #include <stdint.h>
 #include <stdbool.h>
 

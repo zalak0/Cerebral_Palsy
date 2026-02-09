@@ -1,37 +1,6 @@
 #include "laugh.h"
 #include <string.h>
 #include <math.h>
-#include <stdio.h> // ✅ 加上这个，方便 printf
-
-static void cl_dump_window(const CL_State *st,
-                           int n,
-                           float noise_floor,
-                           float dyn,
-                           float height_thr,
-                           float prom_thr,
-                           int peak_n)
-{
-#if CL_DEBUG_DUMP
-    // 头信息
-    printf("WIN,n=%d,sec=%.3f,noise=%.6f,dyn=%.6f,height=%.6f,prom=%.6f,peaks=%d\n",
-           n, (float)n * st->frame_sec, noise_floor, dyn, height_thr, prom_thr, peak_n);
-
-    // RMS 序列（old->new 已经在 rms_tmp 里）
-    for (int i = 0; i < n; i++)
-    {
-        // CSV: index, time, rms
-        printf("R,%d,%.3f,%.6f\n", i, (float)i * st->frame_sec, st->rms_tmp[i]);
-    }
-
-    // peaks 列表
-    for (int i = 0; i < peak_n; i++)
-    {
-        printf("P,%d\n", st->peaks[i]);
-    }
-
-    printf("END\n");
-#endif
-}
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -481,149 +450,6 @@ static bool burst_shape_ok(const float *rms, int n,
     return (up_ratio >= up_ratio_thr) && (down_ratio >= down_ratio_thr);
 }
 
-// ====================== CRY wide-hill / plateau (RMS only) ======================
-// 适合“宽、缓慢上升下降”的哭声：不依赖尖峰数量
-// ====================== CRY wide-hill / plateau (RMS only) ======================
-// 更严格：必须像“单个宽山丘”，不能在段内多次起伏（避免 laugh 被吸进去）
-static bool cry_plateau_ok(const float *rms, int n,
-                           float noise_floor, float dyn,
-                           float frame_sec,
-                           int *out_s, int *out_e, int *out_pk,
-                           float *out_smoothness,
-                           int *out_turns)
-{
-    // 参数（更保守）
-    const float thr_k = 0.28f; // 门限 = noise + thr_k*dyn（略提高）
-    const float min_dur_sec = 0.35f;
-    const float max_dur_sec = 2.20f; // 缩短最大时长，减少“长段 laughter”误判
-    const float rise_k = 0.22f;
-    const float fall_k = 0.22f;
-    const float min_side_sec = 0.10f;
-
-    // “单峰山丘”形状约束
-    const float d_dead = 0.01f;     // 一阶差分死区（抑制抖动）
-    const int max_turns = 2;        // 允许的导数符号翻转次数（单峰≈1次）
-    const float smooth_thr = 0.10f; // 二阶差分平均绝对值（越小越平滑）
-
-    if (n < 10)
-        return false;
-
-    float thr = noise_floor + thr_k * dyn;
-
-    // 找到最长的连续高能段 [s,e)
-    int best_s = -1, best_e = -1, best_len = 0;
-    int i = 0;
-    while (i < n)
-    {
-        if (rms[i] <= thr)
-        {
-            i++;
-            continue;
-        }
-        int s = i;
-        while (i < n && rms[i] > thr)
-            i++;
-        int e = i;
-        int len = e - s;
-        if (len > best_len)
-        {
-            best_len = len;
-            best_s = s;
-            best_e = e;
-        }
-    }
-    if (best_len <= 0)
-        return false;
-
-    float dur = (float)best_len * frame_sec;
-    if (dur < min_dur_sec || dur > max_dur_sec)
-        return false;
-
-    // 在段内找 peak
-    float pk = -1.0f;
-    int pk_i = best_s;
-    for (int k = best_s; k < best_e; k++)
-    {
-        if (rms[k] > pk)
-        {
-            pk = rms[k];
-            pk_i = k;
-        }
-    }
-
-    float start = rms[best_s];
-    float endv = rms[best_e - 1];
-
-    float rise = pk - start;
-    float fall = pk - endv;
-
-    if (rise < rise_k * dyn)
-        return false;
-    if (fall < fall_k * dyn)
-        return false;
-
-    float left_sec = (float)(pk_i - best_s) * frame_sec;
-    float right_sec = (float)(best_e - 1 - pk_i) * frame_sec;
-    if (left_sec < min_side_sec || right_sec < min_side_sec)
-        return false;
-
-    // ===== 单峰约束 1：导数符号翻转次数（turns） =====
-    int turns = 0;
-    int prev_sign = 0;
-    for (int k = best_s; k < best_e - 1; k++)
-    {
-        float d = rms[k + 1] - rms[k];
-        int sign = 0;
-        if (d > d_dead)
-            sign = +1;
-        else if (d < -d_dead)
-            sign = -1;
-        else
-            sign = 0; // deadband
-
-        if (sign != 0)
-        {
-            if (prev_sign != 0 && sign != prev_sign)
-            {
-                turns++;
-            }
-            prev_sign = sign;
-        }
-    }
-    if (turns > max_turns)
-        return false; // laugh 常常 turns 很多
-
-    // ===== 单峰约束 2：平滑度（平均|二阶差分|）=====
-    double s2 = 0.0;
-    int c2 = 0;
-    // 归一化到 dyn，避免音量影响
-    float inv = (dyn > EPS) ? (1.0f / dyn) : 1.0f;
-    for (int k = best_s; k < best_e - 2; k++)
-    {
-        float x0 = (rms[k] - noise_floor) * inv;
-        float x1 = (rms[k + 1] - noise_floor) * inv;
-        float x2 = (rms[k + 2] - noise_floor) * inv;
-        float d2 = x2 - 2.0f * x1 + x0;
-        s2 += fabs((double)d2);
-        c2++;
-    }
-    float smoothness = (c2 > 0) ? (float)(s2 / (double)c2) : 999.0f;
-    if (smoothness > smooth_thr)
-        return false;
-
-    if (out_s)
-        *out_s = best_s;
-    if (out_e)
-        *out_e = best_e;
-    if (out_pk)
-        *out_pk = pk_i;
-    if (out_smoothness)
-        *out_smoothness = smoothness;
-    if (out_turns)
-        *out_turns = turns;
-    return true;
-}
-
 // ====================== TALK pattern (挡板用，方案2不输出) ======================
 static bool is_talk_pattern(CL_State *st,
                             const float *rms, const float *flat, const float *cent,
@@ -986,7 +812,6 @@ CL_Label cl_classify_latest(CL_State *st, CL_Debug *dbg)
         dbg->dyn = dyn;
         dbg->num_peaks = peak_n;
     }
-    cl_dump_window(st, n, noise_floor, dyn, height_thr, prom_thr, peak_n);
 
     // ========= Decision order =========
     // 方案2：保留 talk 检测当挡板，但 talk 不输出，只返回 UNKNOWN
@@ -1010,25 +835,6 @@ CL_Label cl_classify_latest(CL_State *st, CL_Debug *dbg)
     }
 
     int cry_good = 0, cry_checked = 0;
-
-    // ===== NEW: CRY plateau rule (wide single-hill) =====
-    int pl_s = -1, pl_e = -1, pl_pk = -1, pl_turns = 0;
-    float pl_smooth = 0.0f;
-    bool cry_pl = cry_plateau_ok(st->rms_tmp, n, noise_floor, dyn, st->frame_sec,
-                                 &pl_s, &pl_e, &pl_pk, &pl_smooth, &pl_turns);
-    if (cry_pl)
-    {
-        if (dbg)
-        {
-            dbg->cry_good_peaks = 999;                                   // 标记 plateau 命中
-            dbg->cry_checked_peaks = pl_e - pl_s;                        // plateau 帧数
-            dbg->cry_burst_ratio = (float)(pl_e - pl_s) * st->frame_sec; // plateau 时长(秒)
-            // 额外塞一点信息，方便你看
-            // (这里借用 cry_checked_peaks 之外的字段不太合适，就先不塞别的了)
-        }
-        return CL_CRY;
-    }
-
     for (int i = 0; i < peak_n; i++)
     {
         int pk = st->peaks[i];
