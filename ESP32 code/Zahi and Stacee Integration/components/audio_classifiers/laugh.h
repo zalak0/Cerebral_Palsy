@@ -43,7 +43,7 @@ extern "C"
     int64_t energy_ring[1024]; // FRAME_LEN fixed = 1024
 
     // RMS ring buffer (~last few seconds)
-    float rms_ring[240]; // MAX_RMS_FRAMES fixed = 240
+    float rms_ring[480]; // MAX_RMS_FRAMES fixed = 240
     int rms_widx;
     int rms_count;
     bool new_rms;
